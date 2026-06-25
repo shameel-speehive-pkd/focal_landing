@@ -32,19 +32,37 @@ const NAV_LABELS = ["HOME", "THE APPROACH", "PILOTAGE", "PORT ARRIVAL", "DRY DOC
 
 export default function FocalJourney() {
   const canvas1Ref = useRef<HTMLCanvasElement>(null);
-  const canvas2Ref = useRef<HTMLCanvasElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const imagesRef = useRef<{ [key: string]: HTMLImageElement }>({});
-  const currentFrameRef = useRef<number>(1);
-  const frameAnimRef = useRef<number | null>(null);
 
   const [preloadProgress, setPreloadProgress] = useState(0);
   const [clip1Ready, setClip1Ready] = useState(false);
   const [activeSection, setActiveSection] = useState(0);
   const [currentClip, setCurrentClip] = useState(1);
   const [currentFrame, setCurrentFrame] = useState(1);
-  const [activeCanvas, setActiveCanvas] = useState<1 | 2>(1);
-  const activeCanvasRef = useRef<1 | 2>(1);
+
+  const [renderState, setRenderState] = useState({
+    clipA: 1,
+    frameA: 1,
+    clipB: 1,
+    frameB: 1,
+    mix: 0,
+  });
+  const renderStateRef = useRef({
+    clipA: 1,
+    frameA: 1,
+    clipB: 1,
+    frameB: 1,
+    mix: 0,
+  });
+  const transitionAnimRef = useRef<number | null>(null);
+
+  const updateRenderState = (newState: Partial<typeof renderStateRef.current>) => {
+    const updated = { ...renderStateRef.current, ...newState };
+    renderStateRef.current = updated;
+    setRenderState(updated);
+  };
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [selectedService, setSelectedService] = useState<Service | null>(null);
   const [stats, setStats] = useState({ years: 0, offices: 0, portCalls: 0, vessels: 0 });
@@ -115,17 +133,26 @@ export default function FocalJourney() {
 
     preloadClip1();
     return () => {
-      if (frameAnimRef.current) cancelAnimationFrame(frameAnimRef.current);
+      if (transitionAnimRef.current) cancelAnimationFrame(transitionAnimRef.current);
     };
   }, []);
 
-  const drawFrame = (canvas: HTMLCanvasElement | null, clip: number, frame: number) => {
+  const drawFramesBlended = (
+    canvas: HTMLCanvasElement | null,
+    clip1: number,
+    frame1: number,
+    clip2: number,
+    frame2: number,
+    mix: number
+  ) => {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    const img = imagesRef.current[`${clip}-${frame}`];
-    if (img && img.complete) {
-      const { width, height } = canvas;
+    const { width, height } = canvas;
+    ctx.clearRect(0, 0, width, height);
+
+    const drawImg = (img: HTMLImageElement, alpha: number) => {
+      ctx.globalAlpha = alpha;
       const imgRatio = img.width / img.height;
       const canvasRatio = width / height;
       let startX = 0, startY = 0, drawWidth = width, drawHeight = height;
@@ -136,82 +163,162 @@ export default function FocalJourney() {
         drawHeight = width / imgRatio;
         startY = (height - drawHeight) / 2;
       }
-      ctx.clearRect(0, 0, width, height);
       ctx.drawImage(img, startX, startY, drawWidth, drawHeight);
+    };
+
+    const getSafeImage = (clip: number, frame: number) => {
+      const img = imagesRef.current[`${clip}-${frame}`];
+      if (img && img.complete) return img;
+      const fallback = imagesRef.current[`${clip}-1`];
+      if (fallback && fallback.complete) return fallback;
+      return null;
+    };
+
+    const img1 = getSafeImage(clip1, frame1);
+    const img2 = getSafeImage(clip2, frame2);
+
+    if (mix <= 0) {
+      if (img1) drawImg(img1, 1.0);
+    } else if (mix >= 1) {
+      if (img2) drawImg(img2, 1.0);
+    } else {
+      if (img1) drawImg(img1, 1 - mix);
+      if (img2) drawImg(img2, mix);
     }
+    ctx.globalAlpha = 1.0;
   };
 
   const drawCurrentFrame = () => {
-    const canvas = activeCanvasRef.current === 1 ? canvas1Ref.current : canvas2Ref.current;
-    drawFrame(canvas, currentClip, currentFrame);
+    const canvas = canvas1Ref.current;
+    if (!canvas) return;
+    const { clipA, frameA, clipB, frameB, mix } = renderStateRef.current;
+    drawFramesBlended(canvas, clipA, frameA, clipB, frameB, mix);
   };
 
   useEffect(() => {
     const handleResize = () => {
-      if (canvas1Ref.current && canvas2Ref.current) {
+      if (canvas1Ref.current) {
         canvas1Ref.current.width = window.innerWidth;
         canvas1Ref.current.height = window.innerHeight;
-        canvas2Ref.current.width = window.innerWidth;
-        canvas2Ref.current.height = window.innerHeight;
         drawCurrentFrame();
       }
     };
     window.addEventListener("resize", handleResize);
     handleResize();
     return () => window.removeEventListener("resize", handleResize);
-  }, [currentClip, currentFrame, clip1Ready]);
+  }, [clip1Ready]);
 
   useEffect(() => {
     drawCurrentFrame();
-  }, [currentClip, currentFrame]);
+  }, [renderState]);
 
-  const animateFrame = (targetFrame: number, duration = 2500) => {
-    if (frameAnimRef.current) cancelAnimationFrame(frameAnimRef.current);
-    const startFrame = currentFrameRef.current;
-    const frameDiff = targetFrame - startFrame;
-    if (frameDiff === 0) return;
+  const transitionTo = (targetClip: number, targetFrame: number, playFromStart = false) => {
+    if (transitionAnimRef.current) {
+      cancelAnimationFrame(transitionAnimRef.current);
+      transitionAnimRef.current = null;
+    }
+
+    const { clipA, frameA, clipB, frameB, mix } = renderStateRef.current;
+
+    let startClipA = clipA;
+    let startFrameA = frameA;
+    let startClipB = clipB;
+    let startFrameB = frameB;
+    let startMix = mix;
+    let targetMix = 1;
+
+    if (targetClip === clipB) {
+      targetMix = 1;
+    } else if (targetClip === clipA) {
+      targetMix = 0;
+    } else {
+      if (mix > 0.5) {
+        startClipA = clipB;
+        startFrameA = frameB;
+      } else {
+        startClipA = clipA;
+        startFrameA = frameA;
+      }
+      startClipB = targetClip;
+      startFrameB = playFromStart ? 1 : targetFrame;
+      startMix = 0;
+      targetMix = 1;
+    }
+
+    updateRenderState({
+      clipA: startClipA,
+      frameA: startFrameA,
+      clipB: startClipB,
+      frameB: startFrameB,
+      mix: startMix,
+    });
+
+    const mixDuration = 800; // 800ms crossfade
+    const playDuration = playFromStart ? 3800 : 0; // 3800ms playback
+    const totalDuration = Math.max(mixDuration, playDuration);
+
     const startTime = performance.now();
+
     const step = (now: number) => {
       const elapsed = now - startTime;
-      const progress = Math.min(elapsed / duration, 1);
-      const ease =
-        progress < 0.5
-          ? 4 * progress * progress * progress
-          : 1 - Math.pow(-2 * progress + 2, 3) / 2;
-      const frame = Math.round(startFrame + frameDiff * ease);
-      setCurrentFrame(frame);
-      currentFrameRef.current = frame;
-      if (progress < 1) {
-        frameAnimRef.current = requestAnimationFrame(step);
+      
+      const mixProgress = Math.min(elapsed / mixDuration, 1);
+      const mixEase = mixProgress < 0.5
+        ? 2 * mixProgress * mixProgress
+        : 1 - Math.pow(-2 * mixProgress + 2, 2) / 2;
+      const currentMixVal = startMix + (targetMix - startMix) * mixEase;
+
+      let currentFrameAVal = startFrameA;
+      let currentFrameBVal = startFrameB;
+
+      if (playFromStart) {
+        const frameProgress = Math.min(elapsed / playDuration, 1);
+        const frameEase = frameProgress < 0.5
+          ? 4 * frameProgress * frameProgress * frameProgress
+          : 1 - Math.pow(-2 * frameProgress + 2, 3) / 2;
+        
+        const calculatedFrame = Math.round(1 + (TOTAL_FRAMES - 1) * frameEase);
+        
+        if (targetMix === 1) {
+          currentFrameBVal = calculatedFrame;
+        } else {
+          currentFrameAVal = calculatedFrame;
+        }
       } else {
-        frameAnimRef.current = null;
+        if (targetMix === 1) {
+          currentFrameBVal = targetFrame;
+        } else {
+          currentFrameAVal = targetFrame;
+        }
+      }
+
+      updateRenderState({
+        mix: currentMixVal,
+        frameA: currentFrameAVal,
+        frameB: currentFrameBVal,
+      });
+
+      setCurrentClip(targetClip);
+      const activeFrameVal = targetMix === 1 ? currentFrameBVal : currentFrameAVal;
+      setCurrentFrame(activeFrameVal);
+
+      if (elapsed < totalDuration) {
+        transitionAnimRef.current = requestAnimationFrame(step);
+      } else {
+        updateRenderState({
+          clipA: targetClip,
+          frameA: targetFrame,
+          clipB: targetClip,
+          frameB: targetFrame,
+          mix: 0,
+        });
+        setCurrentClip(targetClip);
+        setCurrentFrame(targetFrame);
+        transitionAnimRef.current = null;
       }
     };
-    frameAnimRef.current = requestAnimationFrame(step);
-  };
 
-  const fadeAndSwitchClip = async (targetClip: number, targetFrame: number, playFromStart = false) => {
-    const nextCanvasNum = activeCanvasRef.current === 1 ? 2 : 1;
-    const nextCanvas = nextCanvasNum === 1 ? canvas1Ref.current : canvas2Ref.current;
-
-    const startFrame = playFromStart ? 1 : targetFrame;
-    drawFrame(nextCanvas, targetClip, startFrame);
-
-    setActiveCanvas(nextCanvasNum);
-    activeCanvasRef.current = nextCanvasNum;
-
-    setCurrentClip(targetClip);
-    if (playFromStart) {
-      setCurrentFrame(1);
-      currentFrameRef.current = 1;
-    } else {
-      setCurrentFrame(targetFrame);
-      currentFrameRef.current = targetFrame;
-    }
-
-    if (playFromStart) {
-      animateFrame(targetFrame, 3800);
-    }
+    transitionAnimRef.current = requestAnimationFrame(step);
   };
 
   const lastSectionRef = useRef(0);
@@ -221,38 +328,36 @@ export default function FocalJourney() {
     lastSectionRef.current = activeSection;
 
     if (activeSection === 0) {
-      setCurrentClip(1);
-      animateFrame(1, 2500);
+      transitionTo(1, 1, false);
     } else if (activeSection === 1) {
       if (prev === 0) {
-        setCurrentClip(1);
-        animateFrame(240, 3800);
+        transitionTo(1, 240, true);
       } else {
-        fadeAndSwitchClip(1, 240);
+        transitionTo(1, 240, false);
       }
     } else if (activeSection === 2) {
       if (prev === 1) {
-        fadeAndSwitchClip(2, 240, true);
+        transitionTo(2, 240, true);
       } else {
-        fadeAndSwitchClip(2, 240);
+        transitionTo(2, 240, false);
       }
     } else if (activeSection === 3) {
       if (prev === 2) {
-        fadeAndSwitchClip(3, 240, true);
+        transitionTo(3, 240, true);
       } else {
-        fadeAndSwitchClip(3, 240);
+        transitionTo(3, 240, false);
       }
     } else if (activeSection === 4) {
       if (prev === 3) {
-        fadeAndSwitchClip(4, 240, true);
+        transitionTo(4, 240, true);
       } else {
-        fadeAndSwitchClip(4, 240);
+        transitionTo(4, 240, false);
       }
     } else if (activeSection === 5) {
       if (prev === 4) {
-        fadeAndSwitchClip(5, 240, true);
+        transitionTo(5, 240, true);
       } else {
-        fadeAndSwitchClip(5, 240);
+        transitionTo(5, 240, false);
       }
     } else if (activeSection === 6) {
       animateStats();
@@ -538,13 +643,8 @@ export default function FocalJourney() {
         }`}
       >
         <canvas
-          ref={canvas2Ref}
-          className="absolute inset-0 w-full h-full object-cover"
-        />
-        <canvas
           ref={canvas1Ref}
-          className="absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ease-in-out"
-          style={{ opacity: activeCanvas === 1 ? 1 : 0 }}
+          className="absolute inset-0 w-full h-full object-cover"
         />
         {/* Dark cinematic overlay */}
         <div className="absolute inset-0 bg-gradient-to-t from-black/85 via-black/15 to-black/65 pointer-events-none" />
